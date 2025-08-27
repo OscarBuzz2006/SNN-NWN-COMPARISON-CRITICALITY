@@ -182,7 +182,7 @@ if __name__ == "__main__":
         [0, 0, 1, 0, 1, 0],  # Node 5: connected to 2, 4
     ])
     nwn = NanowireNetwork(adjmtx=adjmtx)
-    v, sizes = find_critical_voltage(nwn, electrodes=[0,1]) #IMPORTANT: OUTPUTS Critical voltage: 0.0506V; Max avalanche size: 
+    v, sizes = find_critical_voltage(nwn, electrodes=[0,1]) #IMPORTANT: OUTPUTS Critical voltage: 0.0506V; Max avalanche size: 4
 
     
     plt.plot(v, sizes)
