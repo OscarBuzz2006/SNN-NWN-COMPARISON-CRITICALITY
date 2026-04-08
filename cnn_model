@@ -1,0 +1,309 @@
+# ==========================================
+# 1. SETUP & IMPORTS
+# ==========================================
+# Install Hugging Face datasets library (quietly)
+
+import subprocess
+import sys
+import ssl
+import urllib.request
+
+
+# Patch SSL for torch hub downloads
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# Also patch urllib directly
+old_urlopen = urllib.request.urlopen
+def patched_urlopen(url, *args, **kwargs):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    kwargs['context'] = ctx
+    return old_urlopen(url, *args, **kwargs)
+urllib.request.urlopen = patched_urlopen
+
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "datasets", "torch", "torchvision", "pandas", "numpy", "pillow"])
+
+
+
+# PyTorch Core Libraries
+import torch                  # The main PyTorch library (handles tensors and GPU acceleration)
+import torch.nn as nn         # Neural Network modules (layers, loss functions)
+import torch.optim as optim   # Optimization algorithms (Adam, SGD, etc., to update weights)
+import torchvision.transforms as T  # Image processing functions specifically for computer vision
+from torch.utils.data import DataLoader # Helps batch and load data efficiently during training
+import torchvision.models as models
+
+# Data Loading & Image Processing
+from datasets import load_dataset, concatenate_datasets # Hugging Face tools to pull and merge data
+from PIL import Image         # Python Imaging Library for handling raw image files
+from io import BytesIO        # Helps read raw byte data into an image format
+
+# Optional: For progress bars so you can see training speed
+from tqdm.auto import tqdm
+
+# Data manipulation
+import pandas as pd # Import pandas for DataFrame operations
+import numpy as np # Import numpy for numerical operations
+
+
+# ==========================================
+# 2. UTILS & TRANSFORMATIONS
+# ==========================================
+# We must standardize all images before the CNN sees them.
+# 1. Resize: CNNs expect a fixed input size (224x224 is standard for image classification/regression).
+# 2. ToTensor: Converts the image from a PIL format (pixels 0-255) into a PyTorch tensor (floats 0.0-1.0).
+transform = T.Compose([
+    T.Resize((224, 224)),
+    T.ToTensor(),
+])
+
+# Modified collate_fn to include numerical features
+def collate_fn(batch):
+    imgs = [x["image"] for x in batch]
+    numerical_data = [x["numerical_data"] for x in batch]
+    labels = [x["pm25"] for x in batch]
+    return torch.stack(imgs), torch.stack(numerical_data), torch.tensor(labels, dtype=torch.float32)
+
+# ===== Define Multimodal Model =====
+class MultimodalModel(nn.Module):
+    def __init__(self, num_numerical_features=5):
+        super().__init__()
+
+        # Exclusively use VGG16 as the backbone
+        vgg = models.vgg16(weights='DEFAULT')
+        self.image_feature_extractor = nn.Sequential(
+            vgg.features,
+            nn.AdaptiveAvgPool2d((1,1)) # VGG features output different sizes, use adaptive pool to get fixed size
+        )
+        image_feature_output_size = 512 # VGG16 with AdaptiveAvgPool2d((1,1)) outputs 512 features
+
+        # Define a simple MLP for numerical features
+        self.numerical_processor = nn.Sequential(
+            nn.Linear(num_numerical_features, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU()
+        )
+
+        # The output feature size from the image model and the numerical processor
+        combined_features_size = image_feature_output_size + 64
+
+        # Final regression head
+        self.regressor = nn.Linear(combined_features_size, 1)
+
+    def forward(self, img_input, num_input):
+        # Process image data
+        img_features = self.image_feature_extractor(img_input)
+        # Flatten the features from the image model (it's 1x1xC after avg pool)
+        img_features = img_features.view(img_features.size(0), -1)
+
+        # Process numerical data
+        num_features = self.numerical_processor(num_input)
+
+        # Concatenate features from both modalities
+        combined_features = torch.cat((img_features, num_features), dim=1)
+
+        # Pass through regression head
+        return self.regressor(combined_features).squeeze(1)
+
+
+# ===== Dataset Class =====
+from torch.utils.data import Dataset, random_split
+
+class RealDataDataset(Dataset):
+    def __init__(self, dataframe, image_size=(224, 224), numerical_cols=None, transform=None):
+        # Make a deep copy to ensure modifications don't affect original df outside
+        self.dataframe = dataframe.copy()
+        self.image_size = image_size
+        self.transform = transform if transform else T.Compose([T.Resize(image_size), T.ToTensor()])
+
+        if numerical_cols is None:
+            # Default numerical columns from era5_df info and project outline
+            self.numerical_cols = [
+                'temp_celsius', 'dewpoint_celsius', 'rh_pct',
+                'wind_speed_m_s', 'pressure_hpa'
+            ]
+        else:
+            self.numerical_cols = numerical_cols
+
+        # Ensure all numerical columns exist in the dataframe and are numeric
+        for col in self.numerical_cols:
+            if col not in self.dataframe.columns:
+                raise ValueError(f"Numerical column '{col}' not found in the DataFrame.")
+            # Convert to numeric, coercing errors to NaN
+            self.dataframe[col] = pd.to_numeric(self.dataframe[col], errors='coerce')
+
+        # Drop rows with NaN in numerical columns after conversion
+        self.dataframe.dropna(subset=self.numerical_cols, inplace=True)
+
+        # Explicitly convert numerical columns to float32 after cleaning to ensure consistent type
+        for col in self.numerical_cols:
+            self.dataframe[col] = self.dataframe[col].astype(np.float32)
+
+        # Ensure 'pm25' column is numeric and handle NaNs for the label
+        if 'pm25' in self.dataframe.columns:
+            self.dataframe['pm25'] = pd.to_numeric(self.dataframe['pm25'], errors='coerce')
+            self.dataframe.dropna(subset=['pm25'], inplace=True) # Drop rows where pm25 label is NaN
+            self.dataframe['pm25'] = self.dataframe['pm25'].astype(np.float32) # Cast label to float32
+        else:
+            raise ValueError("pm25 column not found in DataFrame. This is required for PM2.5 labels.")
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        row = self.dataframe.iloc[idx]
+
+        img_bytes = row['image']
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+        
+        # Resize first, then manually convert to tensor (bypasses broken ToTensor)
+        img = img.resize((224, 224))
+        img_tensor = torch.from_numpy(np.array(img, dtype=np.float32) / 255.0).permute(2, 0, 1)
+
+        numerical_features = torch.tensor(row[self.numerical_cols].to_numpy(dtype=np.float32), dtype=torch.float32)
+        label = row['pm25']
+
+        return {"image": img_tensor, "pm25": label, "numerical_data": numerical_features}
+
+# ==========================================
+# 3. DATA PREPARATION - MERGE ON FILENAME
+# ==========================================
+
+# 1. Load DataFrames
+print("Loading CSV file...")
+era5_df = pd.read_csv('/Users/Not_remy/ENGG2212_ML/FINAL_era5_pm25_weather_data_WITH_FILENAMES.csv')
+
+print("Loading Hugging Face dataset...")
+hf_dataset = load_dataset("DeadCardassian/PM25Vision")
+
+# Convert HF dataset to pandas dataframe
+hf_train_df = hf_dataset['train'].to_pandas()
+
+# 2. Ensure both dataframes have a 'filename' column
+# Check that both have filename columns
+if 'filename' not in era5_df.columns:
+    raise ValueError("CSV file missing 'filename' column")
+if 'filename' not in hf_train_df.columns:
+    raise ValueError("Hugging Face dataset missing 'filename' column")
+
+print("Merging dataframes on 'filename'...")
+
+# 3. Perform the merge on 'filename'
+# Use a left merge to keep all HF images and add CSV data where available
+merged_df = pd.merge(
+    hf_train_df,           # Primary source for image and PM2.5
+    era5_df,               # Source for weather data
+    on='filename',         # Merge on filename column
+    how='left',            # Keep all HF entries, add CSV data if available
+    suffixes=('_hf', '_csv') # Differentiate columns if they exist in both
+)
+
+print("\nMerged DataFrame Head:")
+print(merged_df.head())
+print("\nMerged DataFrame Info:")
+print(merged_df.info())
+print(f"\nTotal rows after merge: {len(merged_df)}")
+print(f"Rows with matching CSV data: {merged_df['temp_celsius'].notna().sum()}")  # Replace with any era5 column name
+
+# Define the numerical features to be used in the model
+numerical_feature_columns = [
+    'temp_celsius', 'dewpoint_celsius', 'rh_pct',
+    'wind_speed_m_s', 'pressure_hpa'
+]
+
+
+
+# IMPORTANT  NOTE - SEE MERGE UPDATE NOTE
+
+# Create the full dataset using the merged dataframe
+print("\nCreating dataset...")
+# Split the dataframe first, then create separate datasets
+merged_df_clean = merged_df.dropna(subset=numerical_feature_columns + ['pm25']).reset_index(drop=True)
+
+train_size = int(0.8 * len(merged_df_clean))
+train_df = merged_df_clean.iloc[:train_size].reset_index(drop=True)
+test_df  = merged_df_clean.iloc[train_size:].reset_index(drop=True)
+
+train_dataset = RealDataDataset(dataframe=train_df, numerical_cols=numerical_feature_columns, transform=transform)
+test_dataset  = RealDataDataset(dataframe=test_df,  numerical_cols=numerical_feature_columns, transform=transform)
+
+ds = {
+    "train": train_dataset,
+    "test": test_dataset
+}
+
+# Setup device
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Create DataLoaders
+train_loader = DataLoader(ds["train"], batch_size=32, shuffle=True, collate_fn=collate_fn)
+test_loader = DataLoader(ds["test"], batch_size=32, shuffle=False, collate_fn=collate_fn)
+
+# Instantiate the multimodal model with VGG16 backbone
+print("\nInitializing model...")
+model = MultimodalModel(num_numerical_features=len(numerical_feature_columns)).to(device)
+
+# Using a slightly lower learning rate is better for pre-trained models
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+criterion = nn.MSELoss()
+
+print(f"Using device: {device}")
+
+# ==========================================
+# 4. MAIN EXECUTION & TRAINING LOOP
+# ==========================================
+epochs = 5
+
+# 2. THE LOOP
+for epoch in range(epochs):
+
+    # -------------------------
+    # --- TRAINING PHASE ---
+    # -------------------------
+    model.train()
+    train_loss = 0.0
+
+    for imgs, numerical_data, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
+        imgs, numerical_data, labels = imgs.to(device), numerical_data.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+
+        outputs = model(imgs, numerical_data)
+
+        loss = criterion(outputs, labels)
+
+        loss.backward()
+
+        optimizer.step()
+
+        train_loss += loss.item()
+
+    avg_train_loss = train_loss / len(train_loader)
+
+    # -------------------------
+    # --- TESTING PHASE ---
+    # -------------------------
+    model.eval()
+    test_loss = 0.0
+
+    with torch.no_grad():
+        for imgs, numerical_data, labels in tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]"):
+            imgs, numerical_data, labels = imgs.to(device), numerical_data.to(device), labels.to(device)
+
+            outputs = model(imgs, numerical_data)
+            loss = criterion(outputs, labels)
+
+            test_loss += loss.item()
+
+    avg_test_loss = test_loss / len(test_loader)
+
+    # -------------------------
+    # --- RESULTS ---
+    # -------------------------
+    print(f"Epoch {epoch+1} Complete | Train Loss: {avg_train_loss:.4f} | Test Loss: {avg_test_loss:.4f}\n")
+
+# Save the trained model
+torch.save(model.state_dict(), 'trained_model.pth')
+print("Model saved to 'trained_model.pth'")
